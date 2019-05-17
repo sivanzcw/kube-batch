@@ -17,6 +17,8 @@ limitations under the License.
 package framework
 
 import (
+	"fmt"
+
 	"github.com/golang/glog"
 
 	"github.com/kubernetes-sigs/kube-batch/pkg/scheduler/api"
@@ -194,6 +196,181 @@ func (s *Statement) unpipeline(task *api.TaskInfo) error {
 	return nil
 }
 
+// Allocate pre-allocate task to node
+func (s *Statement) Allocate(task *api.TaskInfo, hostName string) error {
+	job, found := s.ssn.Jobs[task.Job]
+	if !found {
+		return fmt.Errorf("Failed to found Job <%s> in session <%s> index when try to allocate task <%s:%s>",
+			task.Job, s.ssn.UID, task.Namespace, task.Name)
+	}
+
+	if err := job.UpdateTaskStatus(task, api.Allocated); err != nil {
+		return fmt.Errorf("Failed to update task <%s/%s> status to %s in session <%s> when try to allocate it for: %v",
+			task.Namespace, task.Name, api.Allocated, s.ssn.UID, err)
+	}
+
+	task.NodeName = hostName
+
+	node, foundNode := s.ssn.Nodes[hostName]
+	if !foundNode {
+		return fmt.Errorf("Failed to found Node <%s> in Session <%s> index when try to allocate task <%s:%s> to it",
+			hostName, s.ssn.UID, task.Namespace, task.Name)
+	}
+
+	if err := node.AddTask(task); err != nil {
+		return fmt.Errorf("Failed to allocate task <%s/%s> to node <%s> in session <%s> for: %v",
+			task.Namespace, task.Name, hostName, s.ssn.UID, err)
+	}
+
+	s.operations = append(s.operations, operation{
+		name: "allocate",
+		args: []interface{}{task, hostName},
+	})
+
+	return nil
+}
+
+func (s *Statement) allocate(task *api.TaskInfo, hostName string) error {
+	job, found := s.ssn.Jobs[task.Job]
+	if !found {
+		glog.Errorf("Failed to found Job <%s> in session <%s> index when allocating task <%s:%s>",
+			task.Job, s.ssn.UID, task.Namespace, task.Name)
+		return nil
+	}
+
+	if err := s.ssn.cache.AllocateVolumes(task, hostName); err != nil {
+		glog.Errorf("Failed to allocate volumes for task <%s:%s> when allocating task to node <%s> for: %v",
+			task.Namespace, task.Name, hostName, err)
+		return err
+	}
+
+	for _, eh := range s.ssn.eventHandlers {
+		if eh.AllocateFunc != nil {
+			eh.AllocateFunc(&Event{
+				Task: task,
+			})
+		}
+	}
+
+	if s.ssn.JobReady(job) {
+		for _, task := range job.TaskStatusIndex[api.Allocated] {
+			if err := s.ssn.dispatch(task); err != nil {
+				glog.Errorf("Failed to dispatch task <%s/%s> to node <%s> for: %v",
+					task.Namespace, task.Name, hostName, err)
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+func (s *Statement) deAllocate(task *api.TaskInfo, hostName string) error {
+	job, found := s.ssn.Jobs[task.Job]
+	if !found {
+		glog.Errorf("Failed to found Job <%s> in session <%s> index when deAllocating task <%s:%s>",
+			task.Job, s.ssn.UID, task.Namespace, task.Name)
+		return nil
+	}
+
+	if err := job.UpdateTaskStatus(task, api.Pending); err != nil {
+		glog.Errorf("Failed to update task <%s/%s> status to %s in session <%s> when try to deAllocate it for: %v",
+			task.Namespace, task.Name, api.Pending, s.ssn.UID, err)
+		return err
+	}
+
+	task.NodeName = hostName
+
+	node, foundNode := s.ssn.Nodes[hostName]
+	if !foundNode {
+		glog.Errorf("Failed to found Node <%s> in session <%s> index when try to deAllocate task <%s:%s>",
+			hostName, s.ssn.UID, task.Namespace, task.Name)
+		return nil
+	}
+
+	if err := node.RemoveTask(task); err != nil {
+		glog.Errorf("Failed to deAllocate task <%s/%s> from node <%s> in session <%s> for: %v",
+			task.Namespace, task.Name, hostName, s.ssn.UID, err)
+		return err
+	}
+
+	return nil
+}
+
+// BackFill pre-remove task from node
+func (s *Statement) BackFill(task *api.TaskInfo) error {
+	job, found := s.ssn.Jobs[task.Job]
+	if !found {
+		return fmt.Errorf("Failed to found Job <%s> in session <%s> index when try to backFill task <%s:%s>",
+			task.Job, s.ssn.UID, task.Namespace, task.Name)
+	}
+
+	if err := job.UpdateTaskStatus(task, api.Pending); err != nil {
+		return fmt.Errorf("Failed to update task <%s/%s> status to %s in session <%s> when try to backFill it for: %v",
+			task.Namespace, task.Name, api.Pending, s.ssn.UID, err)
+	}
+
+	node, foundNode := s.ssn.Nodes[task.NodeName]
+	if !foundNode {
+		return fmt.Errorf("Failed to found Node <%s> in session <%s> index when try to backFill task <%s:%s>",
+			task.NodeName, s.ssn.UID, task.Namespace, task.Name)
+	}
+
+	if err := node.RemoveTask(task); err != nil {
+		return fmt.Errorf("Failed to backFill task <%s/%s> from node <%s> in session <%s> for: %v",
+			task.Namespace, task.Name, task.NodeName, s.ssn.UID, err)
+	}
+
+	s.operations = append(s.operations, operation{
+		name: "backFill",
+		args: []interface{}{task},
+	})
+
+	return nil
+}
+
+func (s *Statement) backFill(task *api.TaskInfo) error {
+	for _, eh := range s.ssn.eventHandlers {
+		if eh.DeallocateFunc != nil {
+			eh.DeallocateFunc(&Event{
+				Task: task,
+			})
+		}
+	}
+
+	return nil
+}
+
+func (s *Statement) deBackFill(task *api.TaskInfo) error {
+	job, found := s.ssn.Jobs[task.Job]
+	if !found {
+		glog.Errorf("Failed to found Job <%s> in session <%s> index when deBackFilling task <%s:%s>",
+			task.Job, s.ssn.UID, task.Namespace, task.Name)
+		return nil
+	}
+
+	if err := job.UpdateTaskStatus(task, api.Allocated); err != nil {
+		glog.Errorf("Failed to update task <%s/%s> status to %s in session <%s> when deBackFilling it for: %v",
+			task.Namespace, task.Name, api.Pending, s.ssn.UID, err)
+		return err
+	}
+
+	node, foundNode := s.ssn.Nodes[task.NodeName]
+	if !foundNode {
+		glog.Errorf("Failed to found Node <%s> in session <%s> index when deBackFilling task <%s:%s> from it",
+			task.NodeName, s.ssn.UID, task.Namespace, task.Name)
+		return nil
+	}
+
+	if err := node.AddTask(task); err != nil {
+		glog.Errorf("Failed to add task <%s/%s> to node <%s> in session <%s> for: %v",
+			task.Namespace, task.Name, task.NodeName, s.ssn.UID, err)
+		return err
+	}
+
+	return nil
+}
+
 // Discard operation for evict and pipeline
 func (s *Statement) Discard() {
 	glog.V(3).Info("Discarding operations ...")
@@ -204,6 +381,10 @@ func (s *Statement) Discard() {
 			s.unevict(op.args[0].(*api.TaskInfo), op.args[1].(string))
 		case "pipeline":
 			s.unpipeline(op.args[0].(*api.TaskInfo))
+		case "allocate":
+			s.deAllocate(op.args[0].(*api.TaskInfo), op.args[1].(string))
+		case "backFill":
+			s.deBackFill(op.args[0].(*api.TaskInfo))
 		}
 	}
 }
@@ -217,6 +398,10 @@ func (s *Statement) Commit() {
 			s.evict(op.args[0].(*api.TaskInfo), op.args[1].(string))
 		case "pipeline":
 			s.pipeline(op.args[0].(*api.TaskInfo))
+		case "allocate":
+			s.allocate(op.args[0].(*api.TaskInfo), op.args[1].(string))
+		case "backFill":
+			s.backFill(op.args[0].(*api.TaskInfo))
 		}
 	}
 }
