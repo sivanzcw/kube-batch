@@ -26,6 +26,8 @@ import (
 	"github.com/kubernetes-sigs/kube-batch/pkg/scheduler/plugins/predicates"
 	"github.com/kubernetes-sigs/kube-batch/pkg/scheduler/plugins/priority"
 	"github.com/kubernetes-sigs/kube-batch/pkg/scheduler/plugins/proportion"
+	"github.com/kubernetes-sigs/kube-batch/pkg/scheduler/task-topology"
+	tutil "github.com/kubernetes-sigs/kube-batch/pkg/util/plugins/task-topology"
 )
 
 func init() {
@@ -36,6 +38,7 @@ func init() {
 	framework.RegisterPluginBuilder("priority", priority.New)
 	framework.RegisterPluginBuilder("nodeorder", nodeorder.New)
 	framework.RegisterPluginBuilder("conformance", conformance.New)
+	framework.RegisterPluginBuilder(tutil.Name, task_topology.New)
 
 	// Plugins for Queues
 	framework.RegisterPluginBuilder("proportion", proportion.New)
